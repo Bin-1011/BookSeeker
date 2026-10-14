@@ -15,14 +15,64 @@ APP_NAME = "BookSeeker"
 APP_TITLE = "BookSeeker \u2014 跨书源书籍检索与导出"
 
 
+def is_frozen() -> bool:
+    """当前是否运行在 PyInstaller 打出来的 exe 里。"""
+    return bool(getattr(sys, "frozen", False))
+
+
+def _exe_dir() -> Path | None:
+    """冻结后返回 exe 所在目录；源码运行时返回 None。"""
+    if not is_frozen():
+        return None
+    try:
+        return Path(sys.executable).resolve().parent
+    except OSError:
+        return None
+
+
+def _portable_home() -> Path | None:
+    """免安装模式：优先把数据放在 exe 旁边的 ``BookSeeker-data`` 里。
+
+    绿色软件的习惯是「整个文件夹拷走就带走全部数据」。如果 exe 放在不可写的
+    位置（Program Files、只读介质、压缩包里直接运行），就返回 None，让调用方
+    退回系统目录。
+    """
+    exe_dir = _exe_dir()
+    if exe_dir is None:
+        return None
+    candidate = exe_dir / (APP_NAME + "-data")
+    try:
+        candidate.mkdir(parents=True, exist_ok=True)
+        probe = candidate / ".write-test"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+    except OSError:
+        return None
+    return candidate
+
+
 def _default_home() -> Path:
     env = os.environ.get("BOOKSEEKER_HOME")
     if env:
         return Path(env).expanduser()
+    portable = _portable_home()
+    if portable is not None:
+        return portable
     base = os.environ.get("LOCALAPPDATA") or os.environ.get("XDG_DATA_HOME")
     if base:
         return Path(base) / APP_NAME
     return Path.home() / (".%s" % APP_NAME.lower())
+
+
+def package_path(*parts: str) -> Path:
+    """定位随程序分发的包内资源，兼容 PyInstaller 的解包目录。"""
+    bundled_root = getattr(sys, "_MEIPASS", None)
+    if bundled_root:
+        bundled = Path(bundled_root) / "bookseeker"
+        if bundled.is_dir():
+            return bundled.joinpath(*parts)
+        return Path(bundled_root).joinpath(*parts)
+    return Path(__file__).resolve().parent.joinpath(*parts)
 
 
 HOME: Path = _default_home()

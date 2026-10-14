@@ -20,3 +20,10 @@ library/
 .idea/
 .DS_Store
 Thumbs.db
+
+# 打包相关（构建中间产物和 exe 都不进版本库，exe 走 GitHub Releases）
+.build/
+dist/
+build/
+BookSeeker-data/
+*.spec.bak

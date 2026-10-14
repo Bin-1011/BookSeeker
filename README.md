@@ -58,6 +58,25 @@ Windows 上如果还没装 Python：去 <https://www.python.org/downloads/> 下�
 python BookSeeker.py
 ```
 
+### 方式三：免安装 exe（不用装 Python）
+
+如果你拿到的是打包好的 `BookSeeker.exe`，**双击就能用**，目标电脑不需要安装 Python，
+也不需要任何依赖：
+
+| 文件 | 用途 |
+| --- | --- |
+| `BookSeeker.exe` | 双击启动图形界面 |
+| `BookSeeker-cli.exe` | 在 cmd / PowerShell 里使用命令行 |
+
+程序数据（配置、缓存、插件、日志）默认放在 **exe 同级的 `BookSeeker-data\` 目录**里，
+所以整个文件夹拷到 U 盘或另一台电脑，设置和缓存会一起带走。
+如果 exe 所在位置不可写（比如放在 `C:\Program Files`），会自动改用
+`%LOCALAPPDATA%\BookSeeker\`。也可以用环境变量 `BOOKSEEKER_HOME` 指定。
+
+> 单文件 exe 每次启动都会把自己解压到 `%TEMP%`，在极少数「临时目录禁止写入」
+> 的受限环境里可能起不来（报 `Failed to extract ... Permission denied`）。
+> 遇到这种情况请改用源码方式运行，或者自己用 `--onedir` 打一个文件夹版本。
+
 两种方式都会打开图形界面。想用命令行就直接加参数，见[命令行用法](#命令行用法)。
 
 **不想先跑程序？** 直接看 [`samples/`](samples/) 目录 —— 里面是从真实书源导出的成品
@@ -402,6 +421,8 @@ BookSeeker/
 ├── 启动 BookSeeker.bat            # Windows 双击启动
 ├── README.md
 ├── make_samples.py               # 重新生成 samples/ 里的示例成品
+├── build_exe.bat                 # 一键打包免安装 exe
+├── BookSeeker.spec               # PyInstaller 打包配置
 ├── docs/screenshot-gui.png       # 界面截图
 ├── samples/                      # 示例导出（真实成品，可直接打开）
 ├── bookseeker/
@@ -465,6 +486,24 @@ python tests/test_end_to_end.py  # 端到端：每个书源真实检索→下载
 测试脚本会真实联网（`test_http.py`、`test_epubread.py`、`test_end_to_end.py`），
 导出产物写在 `tests/_out/`。`test_end_to_end.py` 会对每个书源做
 **检索 → 下载 → 导出 EPUB/TXT/HTML → 校验 zip 结构、mimetype、XHTML 良构性、目录** 共 33 项检查。
+
+### 打包免安装 exe
+
+```bash
+build_exe.bat
+```
+
+脚本会自动把 PyInstaller 装到 `.build\pylibs`（不污染系统 Python），
+然后产出 `dist\BookSeeker.exe` 与 `dist\BookSeeker-cli.exe`。
+
+打包时有两个坑值得记住：
+
+1. **动态导入的书源必须列进 `hiddenimports`。** `registry.load_builtins()` 是用
+   `importlib.import_module()` 按名字加载书源的，PyInstaller 的静态分析看不到它们，
+   不显式声明的话打出来的 exe 会「一个内置书源都加载不到」，而且完全不报错。
+2. **GUI 程序要分成两个 exe。** Windows 的 GUI 子系统程序不会阻塞调用它的 shell，
+   在终端里 `BookSeeker.exe sources > out.txt` 会立刻返回、输出也可能丢失，
+   所以命令行场景单独给了控制台版的 `BookSeeker-cli.exe`。
 
 ### 加一个内置书源
 

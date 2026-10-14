@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -147,7 +148,9 @@ def cmd_search(args: argparse.Namespace) -> int:
         return 0
 
     _print_books(books)
-    print("\n共 %d 条结果。用 `BookSeeker.py get <序号>` 下载，例如 `BookSeeker.py get 1`。" % len(books))
+    prog = program_name()
+    print("\n共 %d 条结果。用 `%s get <序号>` 下载，例如 `%s get 1`。"
+          % (len(books), prog, prog))
     return 0
 
 
@@ -303,7 +306,58 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def program_name() -> str:
+    """当前程序的调用名：源码运行时是 BookSeeker.py，打包后是 exe 的名字。"""
+    if config.is_frozen():
+        return os.path.basename(sys.executable) or "BookSeeker"
+    return "BookSeeker.py"
+
+
+def _stdout_usable() -> bool:
+    """当前 stdout 能不能真的写出东西（父进程可能已经重定向到文件/管道）。"""
+    stream = sys.stdout
+    if stream is None:
+        return False
+    try:
+        stream.write("")
+        stream.flush()
+        return True
+    except Exception:
+        return False
+
+
+def attach_parent_console() -> bool:
+    """打包成 GUI（无控制台）程序后，从命令行启动时把输出接回父进程的控制台。
+
+    Windows 的 windowed 程序默认没有 stdout，直接 print 会丢内容。调用
+    ``AttachConsole(ATTACH_PARENT_PROCESS)`` 再把 ``CONOUT$`` 接上之后，
+    同一个 exe 双击就是图形界面，带参数运行就是命令行工具。
+
+    注意：如果父进程已经做了重定向（``> out.txt``），stdout 是可用的，
+    这时绝不能去抢控制台，否则重定向文件会是空的。
+    """
+    if sys.platform != "win32":
+        return False
+    if _stdout_usable():
+        return False
+    try:
+        import ctypes
+
+        ATTACH_PARENT_PROCESS = -1
+        if not ctypes.windll.kernel32.AttachConsole(ATTACH_PARENT_PROCESS):
+            return False
+        sys.stdout = open("CONOUT$", "w", encoding="utf-8", errors="replace", buffering=1)
+        sys.stderr = open("CONOUT$", "w", encoding="utf-8", errors="replace", buffering=1)
+        sys.stdin = open("CONIN$", "r", encoding="utf-8", errors="replace")
+        return True
+    except Exception:
+        return False
+
+
 def main(argv: list[str] | None = None) -> int:
+    # 打包后是 windowed 程序：只有从命令行带参数启动时才需要接控制台
+    if (argv is not None and argv) or (argv is None and len(sys.argv) > 1):
+        attach_parent_console()
     config.setup_console()
     config.bootstrap()
 

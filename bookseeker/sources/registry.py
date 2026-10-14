@@ -301,9 +301,14 @@ def write_example_plugin(dest_dir: str | Path | None = None, overwrite: bool = F
     """把内置的示例插件复制到插件目录，方便用户照着改。"""
     directory = Path(dest_dir) if dest_dir else config_mod.PLUGIN_DIR
     directory.mkdir(parents=True, exist_ok=True)
-    source = Path(__file__).resolve().parent.parent / "examples" / "example_source.py"
+    # 冻结成 exe 后包内资源在 sys._MEIPASS 下，不能再用 __file__ 定位
+    source = config_mod.package_path("examples", "example_source.py")
     if not source.is_file():
-        return None
+        fallback = Path(__file__).resolve().parent.parent / "examples" / "example_source.py"
+        if fallback.is_file():
+            source = fallback
+        else:
+            return None
     target = directory / "example_source.py"
     if target.exists() and not overwrite:
         return target
