@@ -1,0 +1,18 @@
+# 统一换行：仓库里一律存 LF，避免跨平台 diff 噪声
+* text=auto eol=lf
+
+# Windows 批处理必须用 CRLF，否则 cmd.exe 解析标签/goto 会出问题
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# 二进制文件不要做换行转换、也别当文本 diff
+*.epub binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.zip binary
+
+# 语言统计（GitHub 会把 HTML 也算进去，明确标注一下）
+*.py linguist-language=Python
