@@ -79,6 +79,10 @@ def build_txt(
         if content.source_url:
             header.append("\u539f\u6587\uff1a%s" % content.source_url)
         header.append("\u5b57\u6570\uff1a\u7ea6 %s \u5b57" % format(content.word_count, ","))
+        # 缺章时在元信息里明说一句，别让用户以为书就是完整的
+        notice = content.missing_notice()
+        if notice:
+            header.append(notice)
         blocks.append("\n".join(header))
 
     chapters = list(content.chapters) or [Chapter(title=content.title or "\u6b63\u6587", html="")]
@@ -87,6 +91,10 @@ def build_txt(
 
     joiner = ("\n\n" + SEPARATOR + "\n\n") if chapter_separator else "\n\n"
     text = joiner.join(blocks)
+    # 正文末尾再提示一次，读者看到最后仍会被提醒
+    tail = content.missing_notice(prefix="\u26a0 \u63d0\u793a\uff1a")
+    if tail:
+        text = text + "\n\n" + SEPARATOR + "\n\n" + tail
     text = text.replace("\r\n", "\n").replace("\r", "\n").strip() + "\n"
 
     if wrap_width and wrap_width > 0:

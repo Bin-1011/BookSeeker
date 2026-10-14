@@ -135,10 +135,23 @@ class BookContent:
     rights: str = ""
     cover: bytes | None = None
     cover_media_type: str = "image/jpeg"
+    #: 抓取失败、用占位符代替的章节数（正文里仍然保留该章的位置）
+    missing_chapters: int = 0
+    #: 因为超过单本上限而没抓的章节数
+    truncated_chapters: int = 0
 
     @property
     def author_text(self) -> str:
         return ", ".join(self.authors) if self.authors else ""
+
+    def missing_notice(self, prefix: str = "⚠ ") -> str:
+        """缺章提示的**纯文本**（不含标签），供 TXT / EPUB / HTML 三个导出共用。
+
+        没有缺章时返回空串，调用方可以无条件拼接。
+        """
+        if self.missing_chapters <= 0:
+            return ""
+        return "%s有 %d 章抓取失败（见正文中的占位说明）" % (prefix, self.missing_chapters)
 
     @property
     def word_count(self) -> int:

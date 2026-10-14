@@ -22,6 +22,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from ..convert import htmlutil
+from ..convert.htmlutil import escape_xml
 from ..models import Book, BookContent, Chapter, normalize_cjk
 from .base import ProgressFn, Source, SourceError
 
@@ -37,9 +38,13 @@ FETCH_WORKERS = 3
 #: 单章失败后最多再试几次，以及退避基数（秒）——MediaWiki 会返回 429
 FETCH_RETRIES = 3
 RETRY_BACKOFF = 2.5
-#: 并发第一遍后仍有缺章时，串行慢速补抓的轮数与每轮间隔（秒）
-RECOVER_ROUNDS = 2
-RECOVER_DELAY = 6.0
+#: 并发第一遍后仍有缺章时，串行慢速补抓的轮数（可在配置里用
+#: ``wikisource_recover_rounds`` 覆盖）与每次补抓前的等待（秒）。
+#: 轮与轮之间还会额外等待，且等待时间逐轮递增。
+RECOVER_ROUNDS = 3
+RECOVER_DELAY = 4.0
+#: 轮间等待的基数（秒）：第 N 轮结束后等待 ``max(1.0, RECOVER_DELAY / 4) * N``
+RECOVER_ROUND_BASE = max(1.0, RECOVER_DELAY / 4)
 
 #: 判定目录页的子页面数量阈值 / 单本最多抓多少章
 TOC_MIN_LINKS = 3
@@ -108,6 +113,19 @@ def _subpage_title(title: str) -> str:
     """取子页面标题的最后一段，例如 ``紅樓夢/第001回`` -> ``第001回``。"""
     tail = (title or "").rsplit("/", 1)[-1].strip()
     return tail or (title or "").strip()
+
+
+def _missing_placeholder(title: str) -> str:
+    """给抓失败的章节生成占位正文（良构 XHTML，标题仍是真实章标题）。
+
+    绝不静默丢章：宁可留一段明确的占位说明，也不让用户拿到一本
+    少了章节却毫无提示的电子书。
+    """
+    name = escape_xml((title or "").strip() or "本章")
+    return (
+        '<p class="no-indent">⚠ 本章（%s）本次抓取失败，通常是站点限流导致的。'
+        "已成功抓取的章节会缓存在本地，稍后重新下载这本书时不会重复下载。</p>" % name
+    )
 
 
 class WikisourceSource(Source):
@@ -259,6 +277,7 @@ class WikisourceSource(Source):
             identifier="%s:%s" % (lang, title), source_name=self.name,
             source_url=_page_url(lang, page),
             description=self._make_description(node, subpages, missed, truncated, book),
+            missing_chapters=missed, truncated_chapters=truncated,
         )
         self.report(progress, len(chapters), len(chapters), "完成：共 %d 章" % len(chapters))
         return content
@@ -305,12 +324,34 @@ class WikisourceSource(Source):
             out.append((title, _clean_text(link.text(strip=True))))
         return out
 
+    def _recover_rounds(self) -> int:
+        """慢速补抓轮数：默认 :data:`RECOVER_ROUNDS`，可用配置覆盖。
+
+        配置项 ``wikisource_recover_rounds`` 允许 0～8 之间的整数；
+        缺项、非数字、布尔值、超范围一律退回默认值，绝不抛异常。
+        """
+        raw = None
+        try:
+            raw = (self.cfg or {}).get("wikisource_recover_rounds")
+        except Exception:  # pragma: no cover - cfg 不是映射时退默认
+            raw = None
+        if raw is None or isinstance(raw, bool):
+            return RECOVER_ROUNDS
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return RECOVER_ROUNDS
+        return max(0, min(value, 8))
+
     def _fetch_chapters(
         self, lang: str, titles: list[str], progress: ProgressFn | None
     ) -> tuple[list[Chapter], int, int]:
         """抓取各章，返回 ``(章节列表, 抓失败的章数, 被截断的章数)``。
 
-        先并发抓一遍（快），缺的再串行、慢速补抓（限速时并发反而更糟）；单章失败只跳过。
+        先并发抓一遍（快），缺的再串行、慢速补抓（限速时并发反而更糟），
+        轮与轮之间的等待逐轮递增。**所有章节都按原顺序保留位置**：
+        最终仍抓不到的那几章用 :func:`_missing_placeholder` 的占位内容代替，
+        所以章数永远等于目录里的章数，缺章数量另行返回给上层。
         """
         truncated = max(0, len(titles) - MAX_CHAPTERS)
         titles = titles[:MAX_CHAPTERS]
@@ -333,27 +374,41 @@ class WikisourceSource(Source):
                     bodies[idx] = body
                 self.report(progress, done, total, "已抓取 %d/%d：%s" % (done, total, name))
 
-        # 第二遍：串行慢速补抓，每轮之间也留间隔
-        for round_no in range(RECOVER_ROUNDS):
+        # 第二遍：串行慢速补抓；每章之前等一会儿，每轮之后等更久（递增）
+        rounds = self._recover_rounds()
+        for round_no in range(rounds):
             missing = [i for i in range(total) if i not in bodies]
             if not missing:
                 break
             self.report(progress, done, total,
-                        "还有 %d 章没抓到，第 %d 轮慢速重试" % (len(missing), round_no + 1))
+                        "还有 %d 章没抓到，第 %d/%d 轮慢速重试"
+                        % (len(missing), round_no + 1, rounds))
             for idx in missing:
                 time.sleep(RECOVER_DELAY)
-                _real, body = self._fetch_one(lang, titles[idx])
+                try:
+                    _real, body = self._fetch_one(lang, titles[idx])
+                except Exception:
+                    body = ""
                 if body:
                     bodies[idx] = body
                     self.report(progress, done, total,
                                 "慢速重试成功：%s" % _subpage_title(titles[idx]))
-            time.sleep(RECOVER_DELAY * 2)
+            # 轮间等待逐轮递增，给站点限流留出恢复时间
+            time.sleep(RECOVER_ROUND_BASE * (round_no + 1))
 
         missed = total - len(bodies)
         if missed:
-            self.report(progress, done, total, "有 %d 章最终没抓到，已跳过" % missed)
-        return ([Chapter(title=_subpage_title(titles[i]), html=bodies[i])
-                 for i in sorted(bodies)], missed, truncated)
+            self.report(progress, done, total,
+                        "有 %d 章最终没抓到，已用占位内容保留章节位置" % missed)
+
+        # 关键：按目录顺序输出每一章，抓失败的章用占位内容顶上，绝不丢章
+        chapters = [
+            Chapter(title=_subpage_title(titles[i]),
+                    html=bodies[i] if i in bodies else _missing_placeholder(
+                        _subpage_title(titles[i])))
+            for i in range(total)
+        ]
+        return chapters, missed, truncated
 
     def _fetch_one(self, lang: str, title: str) -> tuple[str, str]:
         """抓单个页面，返回 ``(真实标题, 清洗后的 XHTML)``；拿不到正文时返回空串。"""
@@ -414,7 +469,8 @@ class WikisourceSource(Source):
         parts = [intro[:300]] if intro else []
         parts.append("维基文库，目录共 %d 章。" % len(subpages))
         if missed:
-            parts.append("其中 %d 章抓取失败已跳过（可能是站点限速，稍后重试可补齐）。" % missed)
+            parts.append("其中 %d 章本次抓取失败，正文里已用占位说明标出"
+                         "（可能是站点限流，稍后重新下载可补齐）。" % missed)
         if truncated:
             parts.append("章节超过上限 %d，已截断后 %d 章。" % (MAX_CHAPTERS, truncated))
         return " ".join(p for p in parts if p)

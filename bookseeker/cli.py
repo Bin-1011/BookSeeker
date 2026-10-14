@@ -18,6 +18,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 from . import __version__, config, exporter
@@ -111,6 +112,17 @@ def _print_books(books: list[Book]) -> None:
         ))
 
 
+def _pad(text: str, width: int) -> str:
+    """按显示宽度补空格（中日韩字符算两格），让进度行对齐。"""
+    used = sum(2 if ord(c) > 0x2000 else 1 for c in text)
+    return text + " " * max(1, width - used)
+
+
+def _seconds_text(value: float) -> str:
+    """秒数显示：整数就不带小数点。"""
+    return "%d" % value if float(value).is_integer() else "%.1f" % value
+
+
 # ----------------------------------------------------------------------
 # 子命令
 # ----------------------------------------------------------------------
@@ -126,31 +138,85 @@ def cmd_search(args: argparse.Namespace) -> int:
             print("可用书源：%s" % ", ".join(registry.ids()), file=sys.stderr)
             return 2
 
-    print("正在检索「%s」…" % args.query, file=sys.stderr)
+    try:
+        wait_seconds = float(config.CONFIG.get("search_deadline", 12.0))
+    except (TypeError, ValueError):
+        wait_seconds = 12.0
+
+    print("正在检索「%s」…（最多等 %s 秒）" % (args.query, _seconds_text(wait_seconds)),
+          file=sys.stderr, flush=True)
+
+    started = time.monotonic()
+    info: dict[str, dict] = {}          # 书源 id -> 本次检索的耗时与结果数
+    timed_out: list[str] = []
+    failed: list[str] = []
+
+    def elapsed() -> float:
+        return time.monotonic() - started
+
+    def label(src) -> str:
+        return src.name or src.id
+
+    def on_batch(src, books):
+        # 每个源一返回就打印，不必等慢源
+        info[src.id] = {"id": src.id, "name": label(src), "count": len(books),
+                        "elapsed": round(elapsed(), 2), "timeout": False, "error": ""}
+        print("  [%5.1fs] %s %d 条" % (elapsed(), _pad(label(src), 24), len(books)),
+              file=sys.stderr, flush=True)
+
+    def on_source_done(src, seconds):
+        # 正常返回但一条结果都没有的源：on_batch 不会回调，这里补上
+        if src.id in info:
+            return
+        info[src.id] = {"id": src.id, "name": label(src), "count": 0,
+                        "elapsed": round(seconds, 2), "timeout": False, "error": ""}
+        print("  [%5.1fs] %s 0 条" % (seconds, _pad(label(src), 24)),
+              file=sys.stderr, flush=True)
 
     def on_error(src, exc):
-        print("  ⚠ %s 检索失败：%s" % (src.name or src.id, exc), file=sys.stderr)
+        is_timeout = isinstance(exc, TimeoutError)
+        (timed_out if is_timeout else failed).append(src.id)
+        info[src.id] = {"id": src.id, "name": label(src), "count": 0,
+                        "elapsed": round(elapsed(), 2), "timeout": is_timeout,
+                        "error": str(exc)}
+        note = "超时，已跳过" if is_timeout else "检索失败：%s" % exc
+        print("  [%5.1fs] %s %s" % (elapsed(), _pad(label(src), 24), note),
+              file=sys.stderr, flush=True)
 
     books = registry.search_all(
         args.query,
         source_ids=source_ids,
         limit_per_source=args.limit,
+        on_batch=on_batch,
         on_error=on_error,
+        on_source_done=on_source_done,
     )
+    cost = elapsed()
+    # `get <序号>` 依赖这个文件，且顺序必须与下面打印/JSON 里的一致
     _save_last_search(args.query, books)
 
     if args.json:
         print(json.dumps({
             "query": args.query,
             "count": len(books),
+            "elapsed": round(cost, 2),
+            "deadline": wait_seconds,
+            "timed_out": timed_out,
+            "failed": failed,
+            "sources": list(info.values()),
             "books": [_book_to_dict(b) for b in books],
         }, ensure_ascii=False, indent=2))
         return 0
 
     _print_books(books)
+    detail = "耗时 %.1f 秒" % cost
+    if timed_out:
+        detail += "，%d 个源超时" % len(timed_out)
+    if failed:
+        detail += "，%d 个源失败" % len(failed)
     prog = program_name()
-    print("\n共 %d 条结果。用 `%s get <序号>` 下载，例如 `%s get 1`。"
-          % (len(books), prog, prog))
+    print("\n共 %d 条结果（%s）。用 `%s get <序号>` 下载，例如 `%s get 1`。"
+          % (len(books), detail, prog, prog))
     return 0
 
 

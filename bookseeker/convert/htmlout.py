@@ -26,6 +26,7 @@ nav.toc h2 { border: none; margin: 0 0 .6em; padding: 0; font-size: 1.1em; }
 nav.toc ol { margin: 0; padding-left: 1.4em; }
 nav.toc li { margin: .25em 0; }
 .meta { font-size: .9em; opacity: .8; text-align: center; }
+.meta.warn { opacity: 1; color: #a33; font-weight: bold; }
 .top { font-size: .8em; opacity: .6; text-decoration: none; }
 """
 
@@ -67,6 +68,10 @@ def build_html(content: BookContent) -> str:
     if content.source_url:
         meta_bits.append('<a href="%s">\u539f\u6587</a>' % escape_attr(content.source_url))
 
+    # 缺章提示：顶部 meta 区单独一行，用 .warn 高亮，别让用户以为书是完整的
+    notice = content.missing_notice()
+    warning = '<p class="meta warn">%s</p>' % escape_xml(notice) if notice else ""
+
     return """<!DOCTYPE html>
 <html lang="{lang}">
 <head>
@@ -78,6 +83,7 @@ def build_html(content: BookContent) -> str:
 <body id="top">
 <h1>{title}</h1>
 <p class="meta">{meta}</p>
+{warning}
 {desc}
 <nav class="toc">
   <h2>\u76ee\u5f55</h2>
@@ -93,6 +99,7 @@ def build_html(content: BookContent) -> str:
         title=escape_xml(content.title or "\u672a\u547d\u540d"),
         css=CSS,
         meta=" \u00b7 ".join(meta_bits),
+        warning=warning,
         desc=(
             '<p class="meta">%s</p>' % escape_xml(content.description)
         ) if content.description else "",

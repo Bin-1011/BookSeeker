@@ -38,6 +38,11 @@ DEFAULT_HEADERS = {
     "Connection": "close",
 }
 
+#: ``hard_retries`` 客户端被限流（429 / 503）时最多再等的秒数。
+#: 检索路径用得上：维基媒体这类站点经常回 429 + Retry-After，等一两秒再试
+#: 往往就成功了，但绝不能为了一个源在后台等上几十秒。
+HARD_RETRY_GRACE = 4.0
+
 
 class HttpError(Exception):
     """网络请求最终失败。"""
@@ -229,9 +234,15 @@ class HttpClient:
         min_interval: float = 0.4,
         cache_enabled: bool = True,
         cache_ttl: float = 7 * 86400,
+        hard_retries: bool = False,
     ) -> None:
         self.timeout = timeout
         self.retries = max(1, int(retries))
+        #: ``retries`` 是否是硬上限：为 True 时被限流（429 / 503）最多只再试一次，
+        #: 而且等待不超过 :data:`HARD_RETRY_GRACE` 秒。检索路径会打开它——
+        #: 「失败一次就放弃」正是检索想要的行为，否则一个被限流的源能在后台
+        #: 按 Retry-After 等上好几分钟。
+        self.hard_retries = bool(hard_retries)
         self.proxy = proxy or ""
         self.min_interval = max(0.0, float(min_interval))
         self.cache_enabled = cache_enabled
@@ -383,11 +394,18 @@ class HttpClient:
         hdrs = dict(DEFAULT_HEADERS)
         if headers:
             hdrs.update({k: v for k, v in headers.items() if v is not None})
-        timeout = timeout or self.timeout
+        # 书源明确指定的超时（例如古腾堡 120 秒的 Gutendex、青空文庫 180 秒的
+        # 索引下载）一律照办——那些是有理由的慢操作；只有没指定时用客户端的默认值。
+        timeout = float(timeout) if timeout else float(self.timeout)
         last_err: Exception | None = None
 
+        retries = self.retries
+        # 被限流时额外给几次机会（下载正文很有用）；检索路径（hard_retries）
+        # 最多只多给一次，而且下面的等待时间也会被压到几秒以内。
+        extra_attempts = 1 if self.hard_retries else 3
+
         attempt = 0
-        max_attempts = self.retries
+        max_attempts = retries
         while attempt < max_attempts:
             self._throttle(url, interval)
             delay: float | None = None
@@ -413,7 +431,10 @@ class HttpClient:
                     # 并且多给几次机会——限流本来就是「等一下再来」的意思。
                     self._stats["throttled"] = self._stats.get("throttled", 0) + 1
                     delay = self._retry_after(exc) or min(30.0, 1.5 * (2 ** attempt))
-                    if attempt >= max_attempts - 1 and max_attempts < self.retries + 3:
+                    if self.hard_retries:
+                        # 检索路径：只等一小会儿再试一次，不能为一个源在后台干等
+                        delay = min(delay, HARD_RETRY_GRACE)
+                    if attempt >= max_attempts - 1 and max_attempts < retries + extra_attempts:
                         max_attempts += 1
                 elif status < 500:
                     # 其它 4xx 重试没有意义

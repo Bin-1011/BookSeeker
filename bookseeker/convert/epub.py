@@ -185,8 +185,15 @@ def _meta_block(content: BookContent, identifier: str) -> str:
             )
     if content.publisher:
         lines.append("    <dc:publisher>%s</dc:publisher>" % escape_xml(content.publisher))
+    notice = content.missing_notice()
     if content.description:
-        lines.append("    <dc:description>%s</dc:description>" % escape_xml(content.description))
+        desc = content.description
+        if notice:
+            desc = "%s %s" % (desc, notice)
+        lines.append("    <dc:description>%s</dc:description>" % escape_xml(desc))
+    elif notice:
+        # 没有简介时也要让 OPF 里能看出这本书缺章
+        lines.append("    <dc:description>%s</dc:description>" % escape_xml(notice))
     for subject in content.subjects[:12]:
         if subject:
             lines.append("    <dc:subject>%s</dc:subject>" % escape_xml(subject))
@@ -270,25 +277,29 @@ xml:lang="{lang}">
 
 
 def _book_meta_page(content: BookContent) -> str:
-    rows = []
+    rows: list[tuple[str, str, str]] = []          # (标签, 值, 可选的链接地址)
     if content.author_text:
-        rows.append(("\u4f5c\u8005", content.author_text))
+        rows.append(("\u4f5c\u8005", content.author_text, ""))
     if content.source_name:
-        rows.append(("\u6765\u6e90", content.source_name))
+        rows.append(("\u6765\u6e90", content.source_name, ""))
     if content.year:
-        rows.append(("\u5e74\u4ee3", str(content.year)))
+        rows.append(("\u5e74\u4ee3", str(content.year), ""))
     if content.rights:
-        rows.append(("\u7248\u6743", content.rights))
+        rows.append(("\u7248\u6743", content.rights, ""))
     if content.source_url:
-        rows.append(("\u539f\u6587\u94fe\u63a5", content.source_url))
-    rows.append(("\u5b57\u6570", "\u7ea6 %s \u5b57" % format(content.word_count, ",")))
+        rows.append(("\u539f\u6587\u94fe\u63a5", content.source_url, content.source_url))
+    rows.append(("\u5b57\u6570", "\u7ea6 %s \u5b57" % format(content.word_count, ","), ""))
+    # 缺章提示：扉页上要让用户一眼看到这本书不完整
+    notice = content.missing_notice()
+    if notice:
+        rows.append(("\u63d0\u793a", notice, ""))
 
     body = []
-    for label, value in rows:
-        if label == "\u539f\u6587\u94fe\u63a5":
+    for label, value, href in rows:
+        if href:
             body.append(
                 '<p><span class="label">%s\uff1a</span><a href="%s">%s</a></p>'
-                % (escape_xml(label), escape_attr(value), escape_xml(value))
+                % (escape_xml(label), escape_attr(href), escape_xml(value))
             )
         else:
             body.append(

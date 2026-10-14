@@ -109,6 +109,19 @@ DEFAULTS: dict = {
     "cache_ttl_days": 7,
     "cache_enabled": True,
     "request_interval": 0.7,          # 同一域名两次请求的最小间隔（秒）
+    # ---- 检索 ----
+    # 一次检索最多等多少秒。到点就返回**已经拿到**的结果，还没回来的书源按
+    # 超时处理（结果不再合并）。0 或负数表示一到点就返回、不等待。
+    "search_deadline": 12.0,
+    # 检索路径单次请求的超时上限（秒）。比下载正文短得多：检索失败一次就放弃，
+    # 比让用户干等更符合预期，也能让卡住的后台线程早点结束。
+    # 0 表示不限制（沿用书源自己指定的超时）。
+    "search_timeout": 8.0,
+    # 检索路径最多尝试几次（含第一次）。0 表示沿用 retries 的默认值。
+    "search_retries": 1,
+    # 纯中日韩关键字时，跳过语言声明里完全不含该语言的书源（例如查「红楼梦」
+    # 时不必去只收英文书的 Standard Ebooks）。判断很保守，拿不准就不跳过。
+    "smart_language_filter": True,
     # ---- 书源 ----
     "disabled_sources": [],           # 想临时关掉某个书源就把它加进来
     "max_results_per_source": 30,
