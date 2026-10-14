@@ -3,10 +3,9 @@
 维基文库是维基媒体基金会旗下的公版原文站点，按语言分成多个子域：
 ``zh``（红楼梦、论语…）、``ja``（坊っちゃん、こころ…）、``en``（Moby-Dick…）。
 
-只使用标准库，通过 MediaWiki 的 ``api.php`` 检索与取正文：
-
-* 检索：``action=query&list=search``（带 ``snippet`` 摘要）
-* 正文：``action=parse&prop=text&formatversion=2``（返回渲染后的 HTML）
+只使用标准库，通过 MediaWiki 的 ``api.php`` 检索与取正文：检索用
+``action=query&list=search``（带 ``snippet`` 摘要），正文用
+``action=parse&prop=text&formatversion=2``（返回渲染后的 HTML）。
 
 长篇作品通常拆成「母页面 + 子页面」，例如 ``紅樓夢/第001回``。所以 ``fetch()``
 会先判断母页面是不是目录页：正文里若出现 **≥3 个** ``<页面标题>/xxx`` 形式的
@@ -38,6 +37,9 @@ FETCH_WORKERS = 3
 #: 单章失败后最多再试几次，以及退避基数（秒）——MediaWiki 会返回 429
 FETCH_RETRIES = 3
 RETRY_BACKOFF = 2.5
+#: 并发第一遍后仍有缺章时，串行慢速补抓的轮数与每轮间隔（秒）
+RECOVER_ROUNDS = 2
+RECOVER_DELAY = 6.0
 
 #: 判定目录页的子页面数量阈值 / 单本最多抓多少章
 TOC_MIN_LINKS = 3
@@ -56,9 +58,7 @@ _AUTHOR_EN_RE = re.compile(r"\bby\s+([A-Z][\w.\-']*(?:\s+[A-Z][\w.\-']*){0,3})")
 _AUTHOR_LINK_NS = ("author:", "作者:")
 
 
-# --------------------------------------------------------------------------
-# 小工具
-# --------------------------------------------------------------------------
+# ------------------------------- 小工具 -----------------------------------
 
 
 def _clean_text(html_or_text: str) -> str:
@@ -87,16 +87,12 @@ def _wiki_title(href: str) -> str:
 
 def _api(lang: str, params: dict[str, Any]) -> str:
     """组一个 api.php 的 GET 地址。"""
-    query = dict(params)
-    query.setdefault("format", "json")
+    query = {"format": "json", **params}
     return API_TMPL.format(lang=lang) + "?" + urllib.parse.urlencode(query)
 
 
 def _parse_text(payload: Any) -> dict[str, Any]:
-    """从 ``action=parse`` 返回里取出 ``{"title":…, "html":…}``。
-
-    兼容 ``formatversion=2``（``text`` 是字符串）与 1（``text`` 是 ``{"*": …}``）。
-    """
+    """从 ``action=parse`` 返回里取出 ``{"title":…, "html":…}``；兼容 formatversion 1/2。"""
     node = payload.get("parse") if isinstance(payload, dict) else None
     if not isinstance(node, dict):
         return {}
@@ -155,29 +151,27 @@ class WikisourceSource(Source):
         return self._drop_redundant_subpages(books)
 
     @staticmethod
-    def _drop_redundant_subpages(books: list["Book"]) -> list["Book"]:
-        """母页面已经在结果里时，丢掉它的子页面。
+    def _drop_redundant_subpages(books: list[Book]) -> list[Book]:
+        """母页面已经在结果里时丢掉它的子页面。
 
-        维基文库的全文检索会把「紅樓夢/第001回」这类子页面当成独立结果返回；
-        而 fetch() 抓母页面时会自动把这些子页面拼成整本书，所以它们是纯噪声。
-        比对前先做繁简归一化，否则「後紅樓夢」和「后红楼梦/第01回」会被当成两回事。
+        全文检索会把「紅樓夢/第001回」当成独立结果显示，而 ``fetch()`` 抓母页面时
+        会自动把子页面拼成整本书，所以它们是纯噪声。比对前做繁简归一化，否则
+        「後紅樓夢」和「后红楼梦/第01回」会被当成两回事。
         """
-        parents = set()
-        for book in books:
-            page = book.uid.split(":", 1)[-1]
-            if "/" not in page:
-                parents.add("%s:%s" % (book.language, normalize_cjk(page)))
+        def page_of(book: Book) -> str:
+            return book.uid.split(":", 1)[-1]
 
-        out: list["Book"] = []
+        parents = {"%s:%s" % (b.language, normalize_cjk(page_of(b)))
+                   for b in books if "/" not in page_of(b)}
+        out: list[Book] = []
         for book in books:
-            page = book.uid.split(":", 1)[-1]
+            page = page_of(book)
             if "/" in page:
-                root = normalize_cjk(page.split("/", 1)[0])
-                if "%s:%s" % (book.language, root) in parents:
+                root = "%s:%s" % (book.language, normalize_cjk(page.split("/", 1)[0]))
+                if root in parents:
                     continue
             out.append(book)
         return out
-
     def _search_all_langs(self, query: str, limit: int) -> list[tuple[str, list[dict]]]:
         """并发检索所有语言子域，返回 ``[(lang, 结果), …]``；单语言失败只丢该语言。"""
 
@@ -235,37 +229,34 @@ class WikisourceSource(Source):
             },
         )
 
-    # ------------------------------------------------------------------
-    # 正文
-    # ------------------------------------------------------------------
+    # ----------------------------- 正文 -----------------------------
 
     def fetch(self, book: Book, progress: ProgressFn | None = None) -> BookContent:
         """抓取正文：目录页展开成一章一个子页面，否则整页作为单篇。"""
         lang, page = self._resolve_target(book)
         self.report(progress, 0, 1, "获取页面：%s" % page)
-        # 母页面也走同一套重试逻辑（可能是 429 或瞬时网络错误）；
-        # 这里要拿到未清洗的 DOM，才能从链接里看出是不是目录页。
-        real_title, node = self._fetch_one(lang, page, want_node=True)
+        # 母页面也走同一套重试逻辑；这里要留未清洗的 DOM，才能认出目录页链接
+        real_title, node = self._fetch_node(lang, page)
         if node is None:
             raise SourceError("维基文库页面取不到正文：%s:%s" % (lang, page))
-
+        title = real_title or page
         authors = self._guess_authors(node)
-        subpages = self._find_subpages(node, real_title or page)
+        subpages = self._find_subpages(node, title)
 
         if len(subpages) >= TOC_MIN_LINKS:
             chapters, missed, truncated = self._fetch_chapters(lang, [t for t, _x in subpages],
                                                                progress)
         else:
             missed = truncated = 0
-            chapters = [Chapter(title=real_title or page, html=htmlutil.sanitize_to_xhtml(node))]
+            chapters = [Chapter(title=title, html=htmlutil.sanitize_to_xhtml(node))]
 
         chapters = [c for c in chapters if c.title or c.html.strip()]
         if not chapters:
             raise SourceError("维基文库页面没有可用的正文：%s:%s" % (lang, page))
 
         content = BookContent(
-            title=real_title or page, authors=authors, language=lang, chapters=chapters,
-            identifier="%s:%s" % (lang, real_title or page), source_name=self.name,
+            title=title, authors=authors, language=lang, chapters=chapters,
+            identifier="%s:%s" % (lang, title), source_name=self.name,
             source_url=_page_url(lang, page),
             description=self._make_description(node, subpages, missed, truncated, book),
         )
@@ -317,13 +308,18 @@ class WikisourceSource(Source):
     def _fetch_chapters(
         self, lang: str, titles: list[str], progress: ProgressFn | None
     ) -> tuple[list[Chapter], int, int]:
-        """并发抓取各章，返回 ``(章节列表, 抓失败的章数, 被截断的章数)``；单章失败只跳过。"""
+        """抓取各章，返回 ``(章节列表, 抓失败的章数, 被截断的章数)``。
+
+        先并发抓一遍（快），缺的再串行、慢速补抓（限速时并发反而更糟）；单章失败只跳过。
+        """
         truncated = max(0, len(titles) - MAX_CHAPTERS)
         titles = titles[:MAX_CHAPTERS]
-        total, missed, done = len(titles), 0, 0
+        total = len(titles)
         self.report(progress, 0, total, "目录页：共 %d 章，开始抓取" % total)
 
-        results: list[tuple[int, str, str]] = []
+        # 第一遍：并发
+        bodies: dict[int, str] = {}
+        done = 0
         with ThreadPoolExecutor(max_workers=min(FETCH_WORKERS, max(total, 1))) as pool:
             futures = {pool.submit(self._fetch_one, lang, t): (i, _subpage_title(t))
                        for i, t in enumerate(titles)}
@@ -334,24 +330,43 @@ class WikisourceSource(Source):
                     body = ""
                 done += 1
                 if body:
-                    results.append((idx, name, body))
-                    note = "已抓取第 %d/%d 章：%s" % (done, total, name)
-                else:
-                    missed += 1
-                    note = "跳过（无正文）第 %d/%d：%s" % (done, total, name)
-                self.report(progress, done, total, note)
+                    bodies[idx] = body
+                self.report(progress, done, total, "已抓取 %d/%d：%s" % (done, total, name))
 
-        results.sort(key=lambda item: item[0])
-        return [Chapter(title=name, html=body) for _i, name, body in results], missed, truncated
+        # 第二遍：串行慢速补抓，每轮之间也留间隔
+        for round_no in range(RECOVER_ROUNDS):
+            missing = [i for i in range(total) if i not in bodies]
+            if not missing:
+                break
+            self.report(progress, done, total,
+                        "还有 %d 章没抓到，第 %d 轮慢速重试" % (len(missing), round_no + 1))
+            for idx in missing:
+                time.sleep(RECOVER_DELAY)
+                _real, body = self._fetch_one(lang, titles[idx])
+                if body:
+                    bodies[idx] = body
+                    self.report(progress, done, total,
+                                "慢速重试成功：%s" % _subpage_title(titles[idx]))
+            time.sleep(RECOVER_DELAY * 2)
 
-    def _fetch_one(
-        self, lang: str, title: str, want_node: bool = False
-    ) -> tuple[str, Any]:
-        """抓单个页面，返回 ``(真实标题, 正文)``。
+        missed = total - len(bodies)
+        if missed:
+            self.report(progress, done, total, "有 %d 章最终没抓到，已跳过" % missed)
+        return ([Chapter(title=_subpage_title(titles[i]), html=bodies[i])
+                 for i in sorted(bodies)], missed, truncated)
 
-        ``want_node=True`` 时正文是未清洗的 DOM 节点（用于找子页面链接），
-        否则是清洗好的 XHTML 字符串。维基媒体对高频访问会返回 429，
-        所以取不到正文时退避后重试几次。
+    def _fetch_one(self, lang: str, title: str) -> tuple[str, str]:
+        """抓单个页面，返回 ``(真实标题, 清洗后的 XHTML)``；拿不到正文时返回空串。"""
+        real, node = self._fetch_node(lang, title)
+        if node is None:
+            return real, ""
+        return real, self._strip_nav(htmlutil.sanitize_to_xhtml(node))
+
+    def _fetch_node(self, lang: str, title: str) -> tuple[str, Any]:
+        """抓页面并返回未清洗的 DOM 节点。
+
+        找子页面链接必须用原始 DOM：清洗成 XHTML 时站内相对链接会被丢掉。
+        维基媒体对高频访问会返回 429，所以取不到正文时退避后重试几次。
         """
         url = _api(lang, {"action": "parse", "page": title, "prop": "text",
                           "formatversion": 2, "redirects": 1})
@@ -365,16 +380,12 @@ class WikisourceSource(Source):
                 break
             if attempt < FETCH_RETRIES - 1:
                 time.sleep(RETRY_BACKOFF * (attempt + 1) + random.uniform(0, 1.0))
-
         html = parsed.get("html") or ""
         if not html:
-            return title, (None if want_node else "")
+            return title, None
         node = htmlutil.pick_content(html, "div.mw-parser-output", "#mw-content-text",
                                      "div#bodyContent")
-        real = parsed.get("title") or title
-        if want_node:
-            return real, node
-        return real, self._strip_nav(htmlutil.sanitize_to_xhtml(node))
+        return parsed.get("title") or title, node
 
     @staticmethod
     def _strip_nav(body: str) -> str:
@@ -423,15 +434,11 @@ class WikisourceSource(Source):
                     return names
         except Exception:
             pass
-
         if names:
             return names
+
         try:
-            head = " ".join(
-                _clean_text(htmlutil.html_to_text(n.outer_html()) if hasattr(n, "outer_html")
-                            else str(n))
-                for n in list(node.find_all("table"))[:2]
-            )
+            head = " ".join(_clean_text(n.outer_html()) for n in list(node.find_all("table"))[:2])
         except Exception:
             head = ""
         for regex in (_AUTHOR_JA_RE, _AUTHOR_EN_RE):
@@ -443,5 +450,5 @@ class WikisourceSource(Source):
         return []
 
 
-#: 便于注册表/插件显式引用
+#: 便于注册表 / 插件显式引用
 SOURCES = [WikisourceSource]
